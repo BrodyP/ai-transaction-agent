@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -28,15 +29,11 @@ func main() {
 }
 
 func run(log *slog.Logger) error {
-	if os.Getenv("ANTHROPIC_API_KEY") == "" {
-		return errors.New("ANTHROPIC_API_KEY is not set")
+	llmClient, err := newLLMClient()
+	if err != nil {
+		return err
 	}
 
-	llmClient := llm.New(
-		llm.WithModel(os.Getenv("CLAUDE_MODEL")),
-		llm.WithEffort(os.Getenv("CLAUDE_EFFORT")),
-		llm.WithTimeout(envDuration("LLM_TIMEOUT", 60*time.Second)),
-	)
 	analyzer := service.NewAnalyzer(llmClient)
 	routes := handler.NewTransaction(analyzer, log).Routes()
 
@@ -57,7 +54,8 @@ func run(log *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Info("listening", "addr", addr, "model", llmClient.Model())
+		log.Info("listening", "addr", addr,
+			"provider", llmClient.Provider(), "model", llmClient.Model())
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 		}
@@ -77,6 +75,33 @@ func run(log *slog.Logger) error {
 	}
 	log.Info("shutdown complete")
 	return nil
+}
+
+// newLLMClient builds the provider the environment asks for, failing fast when
+// that provider's API key is missing rather than on the first request.
+func newLLMClient() (llm.Client, error) {
+	provider := llm.Provider(env("LLM_PROVIDER", string(llm.ProviderAnthropic)))
+
+	var keyVar string
+	switch provider {
+	case llm.ProviderAnthropic:
+		keyVar = "ANTHROPIC_API_KEY"
+	case llm.ProviderOpenAI:
+		keyVar = "OPENAI_API_KEY"
+	default:
+		return nil, fmt.Errorf("%w: %q (want %q or %q)",
+			llm.ErrUnknownProvider, provider, llm.ProviderAnthropic, llm.ProviderOpenAI)
+	}
+	if os.Getenv(keyVar) == "" {
+		return nil, fmt.Errorf("%s is not set, required by LLM_PROVIDER=%s", keyVar, provider)
+	}
+
+	return llm.New(
+		llm.WithProvider(string(provider)),
+		llm.WithModel(os.Getenv("LLM_MODEL")),
+		llm.WithEffort(os.Getenv("LLM_EFFORT")),
+		llm.WithTimeout(envDuration("LLM_TIMEOUT", 60*time.Second)),
+	)
 }
 
 func env(key, fallback string) string {

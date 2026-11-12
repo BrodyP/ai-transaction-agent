@@ -113,9 +113,10 @@ func (a *Analyzer) AnalyzeBatch(ctx context.Context, txs []model.Transaction) ([
 		Assessments []model.RiskAssessment `json:"assessments"`
 	}
 	req := llm.StructuredRequest{
-		System: systemPrompt,
-		Prompt: prompt,
-		Schema: assessmentSchema(),
+		System:     systemPrompt,
+		Prompt:     prompt,
+		Schema:     assessmentSchema(),
+		SchemaName: "risk_assessments",
 	}
 	if err := a.llm.Structured(ctx, req, &envelope); err != nil {
 		return nil, fmt.Errorf("service: analyzing %d transaction(s): %w", len(normalized), err)
