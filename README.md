@@ -1,36 +1,48 @@
 # ai-transaction-agent
 
-An HTTP service that classifies bank and card transactions with Claude. Give it
-a raw transaction — the kind of line a bank feed produces, full of processor
-prefixes and store numbers — and it returns a category, a clean merchant name,
-a confidence score, and a flag for whether a human should look at it.
+An HTTP service that scores payment transactions for risk with Claude. Give it
+a transaction — amount, merchant, status, how many times it has been retried —
+and it returns a risk level, the signals it decided on, and how sure it is.
 
 ```
-POST /v1/transactions/classify
-{ "id": "tx_1", "date": "2026-11-10T08:14:00Z",
-  "description": "SQ *BLUE BOTTLE 00042 SF", "amount": 6.75,
-  "currency": "USD", "direction": "debit" }
+POST /v1/transactions/analyze
+{
+  "transaction_id": "tx_1001",
+  "amount": 50000,
+  "currency": "THB",
+  "merchant": "UNKNOWN_SHOP",
+  "status": "FAILED",
+  "retry_count": 8
+}
 
 200 OK
-{ "transaction_id": "tx_1", "category": "dining",
-  "normalized_name": "Blue Bottle Coffee", "confidence": 0.94,
-  "recurring": false, "needs_review": false,
-  "reasoning": "Square prefix on a known coffee roaster at a cafe price point.",
-  "suggested_tags": ["coffee", "cafe"] }
+{
+  "transaction_id": "tx_1001",
+  "risk_level": "HIGH",
+  "reason": "High amount and repeated failures",
+  "confidence": 0.92
+}
 ```
 
 ## Why it is built this way
 
 The model's answer is constrained by a JSON schema (Anthropic's structured
-outputs), not by asking politely for JSON in the prompt. The category enum in
-that schema is generated from `model.Categories`, so the model physically
-cannot return a category the rest of the system does not understand — and
-adding a category is a one-line change in one place.
+outputs), not by asking politely for JSON in the prompt. The `risk_level` enum
+in that schema is generated from `model.RiskLevels`, so the model physically
+cannot return a level the rest of the system does not understand — and adding
+one (`CRITICAL`, say) is a one-line change in one place.
 
-Results are also realigned against the input: every transaction you send gets
-exactly one classification back, in the order you sent it. Anything the model
-skipped or answered unusably comes back as a `needs_review` placeholder instead
-of silently disappearing from the response.
+Batch results are realigned against the input, so every transaction you send
+gets exactly one assessment back, in the order you sent it. A transaction the
+model skipped or answered unusably comes back as `HIGH` at confidence `0` with
+a reason saying so. That is deliberate: a missing assessment is an unanswered
+question, and in a risk pipeline an unanswered question belongs in a review
+queue rather than waved through as `LOW`.
+
+Transaction `status` is *not* validated against a fixed list. A payment
+processor will eventually send a status nobody here anticipated, and rejecting
+the request would be worse than letting the model reason about the string.
+`model.go` documents the statuses the prompt is written to expect.
 
 ## Layout
 
@@ -40,10 +52,10 @@ of silently disappearing from the response.
 | `internal/handler` | HTTP routing, decoding, status-code mapping |
 | `internal/service` | Prompt construction, the JSON schema, result alignment |
 | `internal/llm` | Anthropic Messages API wrapper — prompt + schema in, JSON out |
-| `internal/model` | Domain types: `Transaction`, `Classification`, `Category` |
+| `internal/model` | Domain types: `Transaction`, `RiskAssessment`, `RiskLevel` |
 
 Each layer depends only on the one below it, and each consumer declares the
-narrow interface it needs (`structuredCaller`, `classifier`), so the LLM can be
+narrow interface it needs (`structuredCaller`, `analyzer`), so the LLM can be
 faked in tests without touching the network.
 
 ## Running it
@@ -62,52 +74,62 @@ The service refuses to start without `ANTHROPIC_API_KEY`.
 
 Liveness check. Returns `{"status":"ok"}`.
 
-### `POST /v1/transactions/classify`
+### `POST /v1/transactions/analyze`
 
-Classifies one transaction. Body is a single transaction object:
+Scores one transaction. Body is a single transaction object:
 
 | Field | Type | Required | Notes |
 | --- | --- | --- | --- |
-| `id` | string | yes | Echoed back as `transaction_id` |
-| `date` | RFC 3339 timestamp | yes | |
-| `description` | string | yes* | *either this or `merchant` |
-| `merchant` | string | no | |
-| `amount` | number | yes | Must be non-zero |
+| `transaction_id` | string | yes | Echoed back in the response |
+| `amount` | number | yes | Major currency units (baht, not satang); must not be negative |
 | `currency` | string | yes | 3-letter ISO code |
-| `direction` | string | yes | `debit` or `credit` |
-| `account` | string | no | |
+| `merchant` | string | no | An empty or placeholder name is itself a risk signal |
+| `status` | string | yes | `PENDING`, `SUCCESS`, `FAILED`, `DECLINED`, `REVERSED`, `CHARGEBACK`, or anything else your processor emits |
+| `retry_count` | integer | yes | Must not be negative |
 
 Unknown fields are rejected, so a typo in a field name fails loudly instead of
-being silently ignored.
+being silently ignored. `currency` and `status` are upper-cased before the
+model sees them.
 
-### `POST /v1/transactions/classify-batch`
+### `POST /v1/transactions/analyze-batch`
 
-Classifies up to 50 transactions in a single model call — much cheaper and
-faster than 50 separate requests, since the system prompt is sent once.
+Scores up to 50 transactions in a single model call — much cheaper and faster
+than 50 separate requests, since the system prompt is sent once.
 
 ```bash
-curl -s localhost:8080/v1/transactions/classify-batch \
+curl -s localhost:8080/v1/transactions/analyze-batch \
   -H 'Content-Type: application/json' \
   -d '{"transactions": [
-        {"id":"tx_1","date":"2026-11-10T08:14:00Z","description":"SQ *BLUE BOTTLE 00042 SF","amount":6.75,"currency":"USD","direction":"debit"},
-        {"id":"tx_2","date":"2026-11-01T00:00:00Z","description":"NETFLIX.COM","amount":15.49,"currency":"USD","direction":"debit"}
+        {"transaction_id":"tx_1001","amount":50000,"currency":"THB","merchant":"UNKNOWN_SHOP","status":"FAILED","retry_count":8},
+        {"transaction_id":"tx_1002","amount":120,"currency":"THB","merchant":"7-Eleven","status":"SUCCESS","retry_count":0}
       ]}'
 ```
 
-Responds with `{"classifications": [...]}`, one entry per input in input order.
+Responds with `{"assessments": [...]}`, one entry per input in input order.
 
 ## Response fields
 
 | Field | Meaning |
 | --- | --- |
 | `transaction_id` | The id you sent |
-| `category` | One of the 15 categories in `internal/model/transaction.go` |
-| `normalized_name` | Merchant name with processor noise, store numbers and city codes stripped |
+| `risk_level` | `LOW`, `MEDIUM` or `HIGH` |
+| `reason` | One short phrase naming the signals that decided it |
 | `confidence` | 0.0–1.0 |
-| `recurring` | Looks like a subscription or scheduled payment |
-| `needs_review` | Set by the model, and forced on whenever `confidence < 0.7` |
-| `reasoning` | One sentence naming the deciding signal |
-| `suggested_tags` | Up to three search keywords; omitted when nothing applies |
+
+## What the model weighs
+
+Spelled out in the system prompt in `internal/service/classifier.go`:
+
+- **`retry_count`** — a few retries are normal; 5+ failed attempts is the
+  signature of card testing.
+- **`status`** — `SUCCESS` is neutral, `FAILED`/`DECLINED` raise risk,
+  `REVERSED`/`CHARGEBACK` are serious.
+- **`amount` against `currency`** — judged per currency, not against one global
+  threshold. 50,000 THB is a large consumer payment; 50,000 JPY is ordinary.
+- **`merchant`** — a placeholder or test-looking name means the counterparty
+  cannot be verified.
+- **Combinations** — a large amount at an unverifiable merchant that keeps
+  failing is worse than the sum of the three.
 
 ## Status codes
 
@@ -132,10 +154,16 @@ go vet ./...
 go test -race -cover ./...
 ```
 
+Tests cover the handler and service layers against a fake LLM — the request and
+response contract, the status-code mapping, result alignment and the
+fail-closed placeholder. `internal/llm` is not covered: exercising it means a
+real API call.
+
 ## Not built yet
 
-- No tests. The interfaces are in place for them (`structuredCaller` and
-  `classifier` are both fakeable) but none are written.
-- No persistence — classifications are returned, never stored.
+- No persistence — assessments are returned, never stored.
 - No auth on the endpoints, and no rate limiting.
 - No retry on a transient model error; the SDK's own 2 retries are all there is.
+- Risk is judged per transaction in isolation. Velocity across a card, a device
+  or an account — the signal most fraud systems lean on hardest — needs history
+  this service does not keep.

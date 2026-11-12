@@ -1,4 +1,4 @@
-// Command api serves the transaction classification HTTP API.
+// Command api serves the transaction risk analysis HTTP API.
 package main
 
 import (
@@ -37,15 +37,15 @@ func run(log *slog.Logger) error {
 		llm.WithEffort(os.Getenv("CLAUDE_EFFORT")),
 		llm.WithTimeout(envDuration("LLM_TIMEOUT", 60*time.Second)),
 	)
-	classifier := service.NewClassifier(llmClient)
-	routes := handler.NewTransaction(classifier, log).Routes()
+	analyzer := service.NewAnalyzer(llmClient)
+	routes := handler.NewTransaction(analyzer, log).Routes()
 
 	addr := ":" + env("PORT", "8080")
 	srv := &http.Server{
 		Addr:              addr,
 		Handler:           routes,
 		ReadHeaderTimeout: 10 * time.Second,
-		// Generous, because a batch classification waits on the model.
+		// Generous, because a batch analysis waits on the model.
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 120 * time.Second,
 		IdleTimeout:  120 * time.Second,

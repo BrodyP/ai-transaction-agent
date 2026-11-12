@@ -1,4 +1,4 @@
-// Package handler exposes the classifier over HTTP.
+// Package handler exposes the risk analyzer over HTTP.
 package handler
 
 import (
@@ -16,32 +16,32 @@ import (
 // maxBodyBytes caps a request body so a huge payload cannot exhaust memory.
 const maxBodyBytes = 1 << 20 // 1 MiB
 
-// classifier is the slice of service.Classifier this handler needs.
-type classifier interface {
-	Classify(ctx context.Context, tx model.Transaction) (model.Classification, error)
-	ClassifyBatch(ctx context.Context, txs []model.Transaction) ([]model.Classification, error)
+// analyzer is the slice of service.Analyzer this handler needs.
+type analyzer interface {
+	Analyze(ctx context.Context, tx model.Transaction) (model.RiskAssessment, error)
+	AnalyzeBatch(ctx context.Context, txs []model.Transaction) ([]model.RiskAssessment, error)
 }
 
-// Transaction serves the transaction classification endpoints.
+// Transaction serves the transaction risk analysis endpoints.
 type Transaction struct {
-	classifier classifier
-	log        *slog.Logger
+	analyzer analyzer
+	log      *slog.Logger
 }
 
-// NewTransaction wires a handler to a classifier.
-func NewTransaction(c classifier, log *slog.Logger) *Transaction {
+// NewTransaction wires a handler to an analyzer.
+func NewTransaction(a analyzer, log *slog.Logger) *Transaction {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Transaction{classifier: c, log: log}
+	return &Transaction{analyzer: a, log: log}
 }
 
 // Routes returns the handler's routes mounted on a fresh mux.
 func (h *Transaction) Routes() *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", h.health)
-	mux.HandleFunc("POST /v1/transactions/classify", h.classifyOne)
-	mux.HandleFunc("POST /v1/transactions/classify-batch", h.classifyBatch)
+	mux.HandleFunc("POST /v1/transactions/analyze", h.analyzeOne)
+	mux.HandleFunc("POST /v1/transactions/analyze-batch", h.analyzeBatch)
 	return mux
 }
 
@@ -49,26 +49,26 @@ func (h *Transaction) health(w http.ResponseWriter, _ *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-func (h *Transaction) classifyOne(w http.ResponseWriter, r *http.Request) {
+func (h *Transaction) analyzeOne(w http.ResponseWriter, r *http.Request) {
 	var tx model.Transaction
 	if err := decodeJSON(w, r, &tx); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := tx.Validate(); err != nil {
+	if err := tx.Normalized().Validate(); err != nil {
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 		return
 	}
 
-	result, err := h.classifier.Classify(r.Context(), tx)
+	assessment, err := h.analyzer.Analyze(r.Context(), tx)
 	if err != nil {
-		h.writeClassifyError(w, err)
+		h.writeAnalyzeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, assessment)
 }
 
-func (h *Transaction) classifyBatch(w http.ResponseWriter, r *http.Request) {
+func (h *Transaction) analyzeBatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Transactions []model.Transaction `json:"transactions"`
 	}
@@ -81,28 +81,28 @@ func (h *Transaction) classifyBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	results, err := h.classifier.ClassifyBatch(r.Context(), req.Transactions)
+	assessments, err := h.analyzer.AnalyzeBatch(r.Context(), req.Transactions)
 	if err != nil {
-		h.writeClassifyError(w, err)
+		h.writeAnalyzeError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"classifications": results})
+	writeJSON(w, http.StatusOK, map[string]any{"assessments": assessments})
 }
 
-// writeClassifyError maps a classifier error onto a status code. Everything
-// the caller could have fixed is a 4xx; anything else is logged and reported
-// as a 5xx without leaking internals.
-func (h *Transaction) writeClassifyError(w http.ResponseWriter, err error) {
+// writeAnalyzeError maps an analyzer error onto a status code. Everything the
+// caller could have fixed is a 4xx; anything else is logged and reported as a
+// 5xx without leaking internals.
+func (h *Transaction) writeAnalyzeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, service.ErrEmptyBatch):
 		writeError(w, http.StatusUnprocessableEntity, err.Error())
 	case errors.Is(err, llm.ErrRefused):
-		writeError(w, http.StatusUnprocessableEntity, "the model declined to classify this payload")
+		writeError(w, http.StatusUnprocessableEntity, "the model declined to assess this payload")
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
-		writeError(w, http.StatusGatewayTimeout, "classification timed out")
+		writeError(w, http.StatusGatewayTimeout, "risk analysis timed out")
 	default:
-		h.log.Error("classification failed", "error", err)
-		writeError(w, http.StatusBadGateway, "classification failed")
+		h.log.Error("risk analysis failed", "error", err)
+		writeError(w, http.StatusBadGateway, "risk analysis failed")
 	}
 }
 
