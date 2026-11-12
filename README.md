@@ -165,8 +165,22 @@ Spelled out in the system prompt in `internal/service/classifier.go`:
 | --- | --- |
 | 400 | Malformed or unparseable JSON body |
 | 422 | Valid JSON, invalid transaction — or the model declined the payload |
-| 502 | The model call failed |
+| 502 | The model call failed for a reason the caller cannot act on |
+| 503 | The provider rate limited us, ran out of credit, or is down |
 | 504 | The model call exceeded `LLM_TIMEOUT` |
+
+A provider problem is a 503, not a 429: the caller did not send too many
+requests, this service did, so a 429 would blame the wrong party. The body
+names which of the three it was, and `Retry-After` is passed on when the
+provider gave one — a rate limit usually does, an exhausted credit balance does
+not, since waiting will not fix it.
+
+The provider's own error text never reaches the caller; it goes to the log,
+because a quota message can name the account. `internal/llm` classifies each
+provider's error into `ErrRateLimited`, `ErrQuotaExhausted` or
+`ErrUnavailable`, which is also where the per-provider quirks live — OpenAI
+reports an empty balance as a 429 with type `insufficient_quota`, the same
+status as real throttling, so only the type separates "wait" from "pay".
 
 ## Configuration
 
@@ -202,7 +216,8 @@ that needs a real API key.
 
 - No persistence — assessments are returned, never stored.
 - No auth on the endpoints, and no rate limiting.
-- No retry on a transient model error; the SDK's own 2 retries are all there is.
+- No retry on a transient model error beyond the SDK's own 2. A 503 with
+  `Retry-After` tells the caller to back off; nothing here backs off on its own.
 - Risk is judged per transaction in isolation. Velocity across a card, a device
   or an account — the signal most fraud systems lean on hardest — needs history
   this service does not keep.

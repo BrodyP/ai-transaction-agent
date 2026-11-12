@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/openai/openai-go/v3"
@@ -74,6 +75,9 @@ func (c *openAIClient) Structured(ctx context.Context, req StructuredRequest, ou
 
 	resp, err := c.api.Responses.New(ctx, params)
 	if err != nil {
+		if upstream := classifyOpenAI(err); upstream != nil {
+			return upstream
+		}
 		return fmt.Errorf("llm/openai: responses request failed: %w", err)
 	}
 
@@ -109,4 +113,38 @@ func firstRefusal(resp *responses.Response) string {
 		}
 	}
 	return ""
+}
+
+// classifyOpenAI maps an SDK error onto one of the package's upstream
+// sentinels, or returns nil when it is some other failure the caller should
+// see verbatim.
+//
+// OpenAI reports an empty credit balance as 429 with type "insufficient_quota"
+// — the same status as real throttling, so the type field is what separates a
+// wait-and-retry from a go-add-money.
+func classifyOpenAI(err error) *UpstreamError {
+	var apiErr *openai.Error
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+
+	var kind error
+	switch {
+	case apiErr.Type == "insufficient_quota", apiErr.Code == "credit_balance_exhausted":
+		kind = ErrQuotaExhausted
+	case apiErr.StatusCode == http.StatusTooManyRequests:
+		kind = ErrRateLimited
+	case apiErr.StatusCode == http.StatusServiceUnavailable:
+		kind = ErrUnavailable
+	default:
+		return nil
+	}
+
+	return &UpstreamError{
+		Kind:       kind,
+		Provider:   ProviderOpenAI,
+		StatusCode: apiErr.StatusCode,
+		RetryAfter: RetryAfterFrom(apiErr.Response),
+		Err:        err,
+	}
 }

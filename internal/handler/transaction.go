@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"math"
 	"net/http"
+	"strconv"
 
 	"github.com/BrodyP/ai-transaction-agent/internal/llm"
 	"github.com/BrodyP/ai-transaction-agent/internal/model"
@@ -92,6 +94,11 @@ func (h *Transaction) analyzeBatch(w http.ResponseWriter, r *http.Request) {
 // writeAnalyzeError maps an analyzer error onto a status code. Everything the
 // caller could have fixed is a 4xx; anything else is logged and reported as a
 // 5xx without leaking internals.
+//
+// A provider that throttles us, runs out of credit or falls over is a 503
+// rather than a 429: the caller did not send too many requests, this service
+// did, so blaming them would be wrong. Each of those carries a reason the
+// caller can act on and, when the provider offered one, a Retry-After.
 func (h *Transaction) writeAnalyzeError(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, service.ErrEmptyBatch):
@@ -100,10 +107,31 @@ func (h *Transaction) writeAnalyzeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, "the model declined to assess this payload")
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		writeError(w, http.StatusGatewayTimeout, "risk analysis timed out")
+	case errors.Is(err, llm.ErrRateLimited):
+		h.writeUnavailable(w, err, "the model provider is rate limiting this service")
+	case errors.Is(err, llm.ErrQuotaExhausted):
+		h.writeUnavailable(w, err, "the model provider reports no remaining credit or quota for this service")
+	case errors.Is(err, llm.ErrUnavailable):
+		h.writeUnavailable(w, err, "the model provider is temporarily unavailable")
 	default:
 		h.log.Error("risk analysis failed", "error", err)
 		writeError(w, http.StatusBadGateway, "risk analysis failed")
 	}
+}
+
+// writeUnavailable reports an upstream problem as 503, passing on the
+// provider's Retry-After when it gave one. The full provider error goes to the
+// log, never to the caller — a quota message naming the account is for whoever
+// operates this service, not for whoever called it.
+func (h *Transaction) writeUnavailable(w http.ResponseWriter, err error, message string) {
+	h.log.Error("model provider unavailable", "error", err)
+
+	var upstream *llm.UpstreamError
+	if errors.As(err, &upstream) && upstream.RetryAfter > 0 {
+		secs := int(math.Ceil(upstream.RetryAfter.Seconds()))
+		w.Header().Set("Retry-After", strconv.Itoa(secs))
+	}
+	writeError(w, http.StatusServiceUnavailable, message)
 }
 
 func decodeJSON(w http.ResponseWriter, r *http.Request, dst any) error {

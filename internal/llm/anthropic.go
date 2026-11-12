@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/anthropics/anthropic-sdk-go"
 	"github.com/anthropics/anthropic-sdk-go/option"
+	"github.com/anthropics/anthropic-sdk-go/shared"
 )
 
 // anthropicClient talks to the Claude Messages API.
@@ -61,6 +63,9 @@ func (c *anthropicClient) Structured(ctx context.Context, req StructuredRequest,
 
 	resp, err := c.api.Messages.New(ctx, params)
 	if err != nil {
+		if upstream := classifyAnthropic(err); upstream != nil {
+			return upstream
+		}
 		return fmt.Errorf("llm/anthropic: messages request failed: %w", err)
 	}
 
@@ -85,4 +90,36 @@ func (c *anthropicClient) Structured(ctx context.Context, req StructuredRequest,
 		return fmt.Errorf("llm/anthropic: decoding structured response: %w", err)
 	}
 	return nil
+}
+
+// classifyAnthropic maps an SDK error onto one of the package's upstream
+// sentinels, or returns nil when it is some other failure the caller should
+// see verbatim.
+func classifyAnthropic(err error) *UpstreamError {
+	var apiErr *anthropic.Error
+	if !errors.As(err, &apiErr) {
+		return nil
+	}
+
+	var kind error
+	switch {
+	case apiErr.Type() == shared.ErrorTypeBillingError:
+		kind = ErrQuotaExhausted
+	case apiErr.Type() == shared.ErrorTypeRateLimitError, apiErr.StatusCode == http.StatusTooManyRequests:
+		kind = ErrRateLimited
+	case apiErr.Type() == shared.ErrorTypeOverloadedError,
+		apiErr.StatusCode == http.StatusServiceUnavailable,
+		apiErr.StatusCode == 529:
+		kind = ErrUnavailable
+	default:
+		return nil
+	}
+
+	return &UpstreamError{
+		Kind:       kind,
+		Provider:   ProviderAnthropic,
+		StatusCode: apiErr.StatusCode,
+		RetryAfter: RetryAfterFrom(apiErr.Response),
+		Err:        err,
+	}
 }

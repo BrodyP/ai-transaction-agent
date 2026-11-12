@@ -3,10 +3,12 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/BrodyP/ai-transaction-agent/internal/llm"
 	"github.com/BrodyP/ai-transaction-agent/internal/model"
@@ -125,6 +127,9 @@ func TestAnalyzeStatusCodes(t *testing.T) {
 			wantCode: http.StatusUnprocessableEntity,
 		},
 		{name: "model refusal", path: "/v1/transactions/analyze", body: valid, err: llm.ErrRefused, wantCode: http.StatusUnprocessableEntity},
+		{name: "rate limited", path: "/v1/transactions/analyze", body: valid, err: llm.ErrRateLimited, wantCode: http.StatusServiceUnavailable},
+		{name: "quota exhausted", path: "/v1/transactions/analyze", body: valid, err: llm.ErrQuotaExhausted, wantCode: http.StatusServiceUnavailable},
+		{name: "provider unavailable", path: "/v1/transactions/analyze", body: valid, err: llm.ErrUnavailable, wantCode: http.StatusServiceUnavailable},
 		{name: "timeout", path: "/v1/transactions/analyze", body: valid, err: context.DeadlineExceeded, wantCode: http.StatusGatewayTimeout},
 		{name: "model failure", path: "/v1/transactions/analyze", body: valid, err: errSentinel, wantCode: http.StatusBadGateway},
 		{name: "empty batch", path: "/v1/transactions/analyze-batch", body: `{"transactions":[]}`, wantCode: http.StatusUnprocessableEntity},
@@ -189,5 +194,78 @@ func TestHealthz(t *testing.T) {
 	}
 	if got := strings.TrimSpace(rec.Body.String()); got != `{"status":"ok"}` {
 		t.Errorf("body = %s", got)
+	}
+}
+
+// An upstream failure must become a 503 that names an actionable cause, pass on
+// the provider's Retry-After, and keep the provider's own message — which can
+// name the account — out of the response body.
+func TestUpstreamErrorResponse(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		err            error
+		wantRetryAfter string
+		wantInBody     string
+	}{
+		{
+			name: "quota with retry hint",
+			err: &llm.UpstreamError{
+				Kind:       llm.ErrQuotaExhausted,
+				Provider:   llm.ProviderOpenAI,
+				StatusCode: http.StatusTooManyRequests,
+				RetryAfter: 30 * time.Second,
+				Err:        errors.New("You have no credits remaining for org-secret-name"),
+			},
+			wantRetryAfter: "30",
+			wantInBody:     "credit or quota",
+		},
+		{
+			name: "rate limit rounds a fractional hint up",
+			err: &llm.UpstreamError{
+				Kind:       llm.ErrRateLimited,
+				Provider:   llm.ProviderAnthropic,
+				StatusCode: http.StatusTooManyRequests,
+				RetryAfter: 1500 * time.Millisecond,
+			},
+			wantRetryAfter: "2",
+			wantInBody:     "rate limiting",
+		},
+		{
+			name: "unavailable without a hint sends no header",
+			err: &llm.UpstreamError{
+				Kind:       llm.ErrUnavailable,
+				Provider:   llm.ProviderAnthropic,
+				StatusCode: 529,
+			},
+			wantRetryAfter: "",
+			wantInBody:     "temporarily unavailable",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/v1/transactions/analyze",
+				strings.NewReader(`{"transaction_id":"tx_1","amount":1,"currency":"THB","merchant":"m","status":"FAILED","retry_count":0}`))
+			NewTransaction(&fakeAnalyzer{err: tc.err}, discardLogger()).Routes().ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusServiceUnavailable {
+				t.Errorf("status = %d, want %d", rec.Code, http.StatusServiceUnavailable)
+			}
+			if got := rec.Header().Get("Retry-After"); got != tc.wantRetryAfter {
+				t.Errorf("Retry-After = %q, want %q", got, tc.wantRetryAfter)
+			}
+			body := rec.Body.String()
+			if !strings.Contains(body, tc.wantInBody) {
+				t.Errorf("body = %s, missing %q", strings.TrimSpace(body), tc.wantInBody)
+			}
+			if strings.Contains(body, "org-secret-name") {
+				t.Error("the provider's own error message leaked into the response body")
+			}
+		})
 	}
 }
